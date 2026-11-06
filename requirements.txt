@@ -1,0 +1,5 @@
+requests>=2.28
+dnspython>=2.3
+beautifulsoup4>=4.11
+rich>=13.0
+prompt_toolkit>=3.0
