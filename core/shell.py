@@ -54,6 +54,7 @@ COMMANDS: dict[str, str] = {
     "set": "Set a module option: set <OPTION> <value>",
     "unset": "Reset an option to its default: unset <OPTION>",
     "run": "Run the current module (also: exploit)",
+    "scan": "Full sweep of a domain: scan <domain> (subdomains + per-host audit)",
     "export": "Save the last results: export <file.json|file.md>",
     "banner": "Redisplay the startup banner",
     "clear": "Clear the screen",
@@ -140,7 +141,8 @@ class Zer0mapShell:
         self.handlers: dict[str, Callable[[list[str], str], bool | None]] = {
             "help": self.do_help, "modules": self.do_modules, "use": self.do_use,
             "back": self.do_back, "show": self.do_show, "info": self.do_info, "set": self.do_set,
-            "unset": self.do_unset, "run": self.do_run, "export": self.do_export,
+            "unset": self.do_unset, "run": self.do_run, "scan": self.do_scan,
+            "export": self.do_export,
             "banner": self.do_banner, "clear": self.do_clear, "exit": self.do_exit,
         }
 
@@ -256,6 +258,7 @@ class Zer0mapShell:
             return
         if name not in self.instances:  # keep one instance so options persist between uses
             self.instances[name] = self.registry[name]()
+            self.instances[name].shell = self
         self.current = self.instances[name]
         print_info(f"Loaded module {name}: {self.current.description}")
 
@@ -379,6 +382,19 @@ class Zer0mapShell:
             }
         console.print()
         print_good(f"Module {mod.name} finished in {elapsed:.1f}s. Use 'export <file.json|file.md>' to save results.")
+
+    def do_scan(self, args, raw):
+        if "scan" not in self.registry:
+            print_error("The scan module is not available.")
+            return
+        self.do_use(["scan"], "scan")
+        if args:
+            try:
+                self.current.set_option("DOMAIN", args[0])
+            except OptionError as exc:
+                print_error(str(exc))
+                return
+        self.do_run([], "")
 
     def do_export(self, args, raw):
         filename = raw.strip().strip("'\"")

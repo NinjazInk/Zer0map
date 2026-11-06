@@ -27,6 +27,9 @@ class BaseModule(ABC):
         self.results: dict | None = None
         # Set when the user hits Ctrl+C; long-running workers should check `self.cancelled`
         self.stop_event = threading.Event()
+        # Back-reference to the shell, set when the module is loaded; lets a module reach
+        # sibling modules' last results (e.g. takeover reusing a subdomains run).
+        self.shell: Any = None
 
     # ------------------------------------------------------------------ options
     def add_option(

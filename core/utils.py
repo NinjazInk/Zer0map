@@ -143,12 +143,16 @@ class RateLimiter:
 
 
 # ----------------------------------------------------------------------------- DNS
-def make_resolver(timeout: float = 3.0, lifetime: float = 5.0) -> dns.resolver.Resolver:
+def make_resolver(
+    timeout: float = 3.0, lifetime: float = 5.0, nameservers: list[str] | None = None
+) -> dns.resolver.Resolver:
     try:
         resolver = dns.resolver.Resolver(configure=True)
     except (dns.resolver.NoResolverConfiguration, OSError):
         resolver = dns.resolver.Resolver(configure=False)
         resolver.nameservers = ["1.1.1.1", "8.8.8.8"]
+    if nameservers:
+        resolver.nameservers = list(nameservers)
     if not resolver.nameservers:
         resolver.nameservers = ["1.1.1.1", "8.8.8.8"]
     resolver.timeout = timeout
@@ -200,6 +204,187 @@ def resolve_host(name: str, resolver: dns.resolver.Resolver) -> dict | None:
     if not a and not aaaa and not cname:
         return None
     return {"a": sorted(a), "aaaa": sorted(aaaa), "cname": cname}
+
+
+# Resolver-level failure codes returned all nameservers answered SERVFAIL
+SERVFAIL_RETRIES = 2
+
+
+def resolve_full(name: str, resolver: dns.resolver.Resolver, retries: int = SERVFAIL_RETRIES) -> dict:
+    """Resolve A/AAAA/CNAME for a name, returning a rich result that always has the same shape.
+
+    Unlike resolve_host this never returns None and never raises for an ordinary lookup: it
+    reports transient resolver failures in the ``error`` field and flags dangling CNAMEs (a
+    CNAME whose chain ends in NXDOMAIN: a subdomain-takeover signal).
+
+    Returns {a, aaaa, cname (str|None), cnames (list), dangling (bool), error (str|None),
+    alive (bool)}.
+    """
+    out = {"a": [], "aaaa": [], "cname": None, "cnames": [], "dangling": False,
+           "error": None, "alive": False}
+
+    def _resolve_with_retry(rtype: str):
+        last: Exception | None = None
+        for attempt in range(1 + retries):
+            try:
+                return resolver.resolve(name, rtype)
+            except dns.resolver.NoNameservers as exc:  # SERVFAIL from every nameserver
+                last = exc
+                if attempt < retries:
+                    time.sleep(0.5 * (attempt + 1))
+        raise last  # type: ignore[misc]
+
+    cnames: list[str] = []
+    for rtype in ("A", "AAAA"):
+        try:
+            answer = _resolve_with_retry(rtype)
+        except dns.resolver.NXDOMAIN:
+            out["dangling"] = _collect_cname(name, resolver, cnames)
+            break
+        except dns.resolver.NoNameservers:
+            out["error"] = "SERVFAIL (server failure) after retries"
+            break
+        except dns.exception.Timeout:
+            out["error"] = out["error"] or "DNS timeout"
+            continue
+        except dns.resolver.NoAnswer:
+            continue
+        except dns.exception.DNSException as exc:
+            out["error"] = out["error"] or f"{type(exc).__name__}"
+            continue
+        for rrset in answer.response.answer:
+            for rdata in rrset:
+                if rrset.rdtype == dns.rdatatype.CNAME:
+                    target = rdata.target.to_text().rstrip(".")
+                    if target not in cnames:
+                        cnames.append(target)
+                elif rrset.rdtype in (dns.rdatatype.A, dns.rdatatype.AAAA):
+                    if rrset.rdtype == dns.rdatatype.A:
+                        out["a"].append(rdata.address)
+                    else:
+                        out["aaaa"].append(rdata.address)
+
+    if not out["a"] and not out["aaaa"] and not cnames and not out["error"]:
+        # No A/AAAA and not NXDOMAIN: the name may still be a bare CNAME (NoAnswer path)
+        _collect_cname(name, resolver, cnames)
+
+    out["a"] = sorted(set(out["a"]))
+    out["aaaa"] = sorted(set(out["aaaa"]))
+    out["cnames"] = cnames
+    out["cname"] = cnames[0] if cnames else None
+    out["alive"] = bool(out["a"] or out["aaaa"] or cnames)
+    return out
+
+
+def _collect_cname(name: str, resolver: dns.resolver.Resolver, cnames: list[str]) -> bool:
+    """Append any CNAME target for ``name`` to ``cnames``. Returns True if one was found."""
+    try:
+        answer = resolver.resolve(name, "CNAME")
+    except dns.exception.DNSException:
+        return False
+    found = False
+    for rdata in answer:
+        target = rdata.target.to_text().rstrip(".")
+        if target not in cnames:
+            cnames.append(target)
+        found = True
+    return found
+
+
+def http_fingerprint(host: str, timeout: float = 5.0) -> tuple[int, int] | None:
+    """Fetch a host over HTTPS then HTTP and return (status_code, content_length), or None."""
+    for scheme in ("https", "http"):
+        try:
+            resp = http_request("GET", f"{scheme}://{host}/", timeout=timeout,
+                                 allow_redirects=True, verify=False)
+            return (resp.status_code, len(resp.content))
+        except ReconError:
+            continue
+    return None
+
+
+# ----------------------------------------------------------------------------- passive sources
+def _clean_name(raw: str, domain: str) -> str | None:
+    """Normalize a candidate hostname; return it only if it is under ``domain``."""
+    name = raw.strip().lower().rstrip(".")
+    while name.startswith("*."):
+        name = name[2:]
+    if not name or " " in name or "@" in name:
+        return None
+    if name == domain or name.endswith("." + domain):
+        return name if DOMAIN_RE.match(name) else None
+    return None
+
+
+def passive_crtsh(domain: str, timeout: float = 45) -> set[str]:
+    """Certificate Transparency search via crt.sh (``%`` is a SQL wildcard)."""
+    import json as _json
+
+    resp = http_request("GET", "https://crt.sh/", params={"q": f"%.{domain}", "output": "json"},
+                        timeout=timeout)
+    if resp.status_code in (429, 502, 503, 504):
+        raise ReconError(f"crt.sh unavailable (HTTP {resp.status_code})")
+    if resp.status_code != 200:
+        raise ReconError(f"crt.sh returned HTTP {resp.status_code}")
+    try:
+        data = resp.json()
+    except (_json.JSONDecodeError, ValueError):
+        raise ReconError("crt.sh returned a non-JSON response") from None
+    if not isinstance(data, list):
+        raise ReconError("unexpected JSON structure from crt.sh")
+    names: set[str] = set()
+    for entry in data:
+        for field in ("name_value", "common_name"):
+            for raw in str(entry.get(field, "")).splitlines():
+                if (n := _clean_name(raw, domain)):
+                    names.add(n)
+    return names
+
+
+def passive_certspotter(domain: str, timeout: float = 20) -> set[str]:
+    """CertSpotter CT-log aggregator (free tier is rate limited)."""
+    resp = http_request(
+        "GET", "https://api.certspotter.com/v1/issuances",
+        params={"domain": domain, "include_subdomains": "true", "expand": "dns_names"},
+        timeout=timeout,
+    )
+    if resp.status_code == 429:
+        raise ReconError("certspotter rate limit exceeded (HTTP 429)")
+    if resp.status_code != 200:
+        raise ReconError(f"certspotter returned HTTP {resp.status_code}")
+    try:
+        data = resp.json()
+    except (ValueError,):
+        raise ReconError("certspotter returned a non-JSON response") from None
+    names: set[str] = set()
+    for issuance in data if isinstance(data, list) else []:
+        for raw in issuance.get("dns_names", []):
+            if (n := _clean_name(raw, domain)):
+                names.add(n)
+    return names
+
+
+def passive_hackertarget(domain: str, timeout: float = 20) -> set[str]:
+    """HackerTarget passive-DNS dataset. Returns CSV lines 'host,ip'."""
+    resp = http_request("GET", "https://api.hackertarget.com/hostsearch/",
+                        params={"q": domain}, timeout=timeout)
+    if resp.status_code != 200:
+        raise ReconError(f"hackertarget returned HTTP {resp.status_code}")
+    text = resp.text
+    if "API count exceeded" in text or text.startswith("error"):
+        raise ReconError(text.strip()[:120] or "hackertarget error")
+    names: set[str] = set()
+    for line in text.splitlines():
+        if (n := _clean_name(line.split(",", 1)[0], domain)):
+            names.add(n)
+    return names
+
+
+PASSIVE_SOURCES: dict[str, Callable[[str], set[str]]] = {
+    "crtsh": passive_crtsh,
+    "certspotter": passive_certspotter,
+    "hackertarget": passive_hackertarget,
+}
 
 
 def resolve_target(host: str) -> list[tuple[int, str]]:
